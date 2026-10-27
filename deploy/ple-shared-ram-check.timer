@@ -1,0 +1,11 @@
+[Unit]
+Description=Hourly integrity watch for the shared PLE table
+
+[Timer]
+OnBootSec=15min
+OnUnitActiveSec=1h
+RandomizedDelaySec=900
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target

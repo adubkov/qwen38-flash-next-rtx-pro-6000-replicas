@@ -1,0 +1,9 @@
+[Unit]
+Description=Verify the shared PLE table is still one read-only, correctly-hashed artifact
+
+[Service]
+Type=oneshot
+Nice=19
+IOSchedulingClass=idle
+ExecStart=/usr/local/bin/ple-shared-ram-check.sh --hash
+TimeoutStartSec=900

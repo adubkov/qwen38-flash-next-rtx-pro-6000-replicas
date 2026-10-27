@@ -1,0 +1,23 @@
+[Unit]
+Description=Publish the shared PLE table before docker starts the flash-next pair
+Documentation=file:/mnt/apps/compose/sglang-flash-next-pair/compose.yaml
+# Only stage when the pair is actually wanted (see the script); costs nothing when
+# another model owns the GPUs.
+DefaultDependencies=no
+After=local-fs.service
+RequiresMountsFor=/mnt/fast
+# The daemon restarts the replicas from their unless-stopped policies and ignores
+# compose depends_on, so the payload must exist before the daemon starts.
+Before=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+Environment=DATA_ROOT=/mnt/fast/docker
+# A hung copy must not hold the whole box's apps hostage: on timeout systemd moves
+# on, the replicas fail closed on the missing payload, and the plugin log says why.
+TimeoutStartSec=420
+ExecStart=/usr/local/bin/ple-stage-onboot.sh
+
+[Install]
+WantedBy=multi-user.target

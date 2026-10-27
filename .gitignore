@@ -1,0 +1,16 @@
+# Working area for material pulled from the serving host before it is scrubbed.
+# Never committed.
+.work/
+
+__pycache__/
+*.pyc
+.DS_Store
+
+# Filled by the operator from .env.example; the shipped template is what belongs
+# in git, the real one names a private image and two cards.
+.env
+
+# Agent/tool scratch from work on this repo. Not ignored, a `git add -A` before the
+# first push would commit audit harnesses — which is exactly how a scratch file
+# carrying planted LAN IPs nearly entered a public tree.
+.qwen/

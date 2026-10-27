@@ -1,0 +1,250 @@
+# Two-replica flash-next pair, ONE compose project.
+#
+# Why one project: `depends_on` is evaluated inside a project only — with A and B
+# in separate projects there was no way to express "B waits for A to be healthy",
+# so both cold-started at once and raced writing the Triton/JIT cache.
+#
+# Rollback to the pre-shared_ram single replicas. The old projects are STOPPED, not
+# deleted, and their files are untouched — but their containers cannot start while
+# this pair holds the ports and GPUs, so free the slot first, one replica at a time:
+#   cd /mnt/apps/compose/sglang-flash-next-pair
+#   sudo docker compose stop flash-next-a                     # frees :30071 + GPU0
+#   (cd ../sglang-qwen38-flash-next   && sudo docker compose up -d flash-next-opt)
+#   sudo docker compose stop flash-next-b                     # frees :30073 + GPU1
+#   (cd ../sglang-qwen38-flash-next-b && sudo docker compose up -d flash-next-opt-b)
+# Each old replica needs ~53 GiB of free RAM to come back in ram mode (the pair plus
+# the 47.68 GiB tmpfs table leaves ~155 GiB available today, so both fit; do not
+# hand that headroom to anything else while this file is the rollback path).
+# To go forward again: stop the old projects the same way, then
+#   sudo docker compose -f compose.yaml up -d          (stager -> A healthy -> B)
+#
+# What differs from those two single-replica files:
+#   * shared_ram PLE: one tmpfs table pinned once, instead of a private
+#     47.68 GiB page-locked copy per replica (measured: container anon 6.01 GB
+#     shared vs 53.35 GiB ram, same container, same run).
+#     Plugin ships from /mnt/apps/sglang-flashnext/shared-ram on PYTHONPATH,
+#     selected by PENNY_SHARED_PLE=1. PENNY_PLE_BACKEND is deliberately untouched:
+#     the image's configs/pennyroyal/ple-backend.sh owns it and rejects anything
+#     outside {ram,nvme} before the plugin loader runs.
+#   * ple-stage publishes the payload into tmpfs; both replicas wait for it
+#     (service_completed_successfully). B additionally waits for A healthy
+#     (service_healthy) — the staggered start.
+#   * /ple is bound rw and the payload is root:975 0660 (replicas get group_add
+#     975): cudaHostRegister only accepts a CPU-writable VMA
+#     (HostRegisterReadOnlySupported=0). Safety is restored by mprotect(PROT_READ)
+#     after registration, which the plugin treats as fatal on failure.
+#   * /model points at the prepared overlay (its index drops the n-gram shards);
+#     the real checkpoint is bound at its own path so the overlay's symlinks
+#     resolve. The plugin aborts if the served index still carries ngram shards.
+#   * restart "unless-stopped" — required, not a preference: a container with
+#     on-failure that exited cleanly is not reliably auto-started when the daemon
+#     comes up, so the pair could stay DOWN after a reboot (briefly tried
+#     on-failure:3 on 2026-09-27... 2026-10-04 and caught in preflight, which also
+#     exposed that ple-stage-onboot.sh only accepted always/unless-stopped -- a
+#     policy the stager does not recognise silently disables boot staging while
+#     docker still starts the replicas, i.e. crash-loop). Crash-loop thrash is
+#     instead contained by: swap disabled (memswap==memory, so no 2026-09-27-style
+#     swap-fill), the 24 GiB cap making an OOM fast, and the boot stager removing
+#     the common cause. Change policy with `docker update --restart` (no recreate)
+#     and keep file == live: a real `up -d` reconciles drift by RECREATING.
+#     CURRENT POLICY (2026-10-06): "no", with boot-start supplied by
+#     /etc/systemd/system/flash-next-pair-boot.service. That split is deliberate —
+#     no Docker restart policy expresses "start at boot but NOT after a crash"
+#     (always/unless-stopped do both, on-failure restarts on crash, "no" does
+#     neither), and this pair runs past the proven stock margin, so a crash must
+#     survive as an Exited container instead of being auto-healed out of sight.
+#     Everything in the paragraph above still applies to anyone who puts the policy
+#     back to "unless-stopped": that reintroduces crash-restart AND makes the boot
+#     stager load-bearing again.
+name: flash-next-pair
+
+x-replica: &replica
+  # The open-source image, from its ORIGINAL registry: Docker Hub `lmsysorg/sglang`
+  # (the project's own namespace), pinned to the digest of tag `v0.5.19-cu130` —
+  # the version and CUDA lane this stack self-reports (`sglang 0.5.19+g…`, CUDA 13.0).
+  # Pin is by digest, never a floating tag; verify with:
+  #   curl -s https://hub.docker.com/v2/repositories/lmsysorg/sglang/tags/v0.5.19-cu130
+  # READ THIS BEFORE EXPECTING IT TO SERVE THE CHECKPOINT: the numbers in this repo
+  # were taken on a vendor SM120/NVFP4 fork of that build (extra NVFP4 + shared-PLE +
+  # mamba/GDN paths) that we have no right to redistribute. It is not this image, and
+  # upstream will reject the checkpoint's flags. Override ENGINE_IMAGE with a build
+  # you are entitled to use; see LICENSING.md.
+  image: "${ENGINE_IMAGE:-lmsysorg/sglang@sha256:d6e7288627be8b02be88e4bba38e73f6d50e2826869f753c13a4c4385ab3eda9}"
+  command: ["next"]
+  shm_size: 32gb
+  # The cap is the fail-open backstop the hook enforcement cannot be: shared mode
+  # holds ~5.6 GiB of this container's own anon (measured under the full C1/C2/C4
+  # ladder: ram mode was 53.35 GiB anon of which 47.68 GiB was the private table),
+  # so a silently-fallback private allocation dies at boot with OOM instead of
+  # serving. It is NOT a working-set limit: page cache from reading ~60 GB of
+  # weights legitimately overshoots it (measured memory.peak 54.28 GiB on a warm
+  # replica) and is reclaimed, not killed -- memory.events showed max 2358,
+  # oom_kill 0. Only valid while the table is SHARED: unset PENNY_SHARED_PLE under
+  # this cap OOMs the replica rather than reverting it -- rollback is the old
+  # 108 GiB projects, not flipping the knob.
+  memswap_limit: 24G
+  # "no" is the intended steady state, not a debug leftover: it makes a crash stay
+  # visible as an Exited container (the pair runs past the margin the stock config
+  # was proven at), and boot-start comes from
+  # /etc/systemd/system/flash-next-pair-boot.service instead — which is also better
+  # ordered than a policy was, because `compose up` honours depends_on
+  # (ple-stage -> A healthy -> B) while the daemon honours nothing.
+  # Consequences to remember:
+  #   * a crashed replica stays DOWN until someone runs `up -d`; llmproxy excludes
+  #     it on its health probe, so the surviving card carries the pool.
+  #   * boot-start is gated on .../sglang-flash-next-pair/boot-start.enabled so that
+  #     deliberately stopping the pair (to hand the GPUs/RAM to another model) still
+  #     survives a reboot. Delete that file to make the pair boot-disabled.
+  #   * `docker start <container>` alone is NOT a valid recovery after a host reboot:
+  #     tmpfs does not survive, so /ple would be empty and the plugin fails closed.
+  #     Use `sudo docker compose -f compose.yaml up -d`.
+  # If the current capacity settings prove unstable, fall back to
+  # MEM_FRACTION_STATIC 0.981 + MAX_TOTAL_TOKENS 899968 (pool 861,632, ~2.9 GB free
+  # under load) — the policy should stay "no".
+  restart: "no"
+  group_add: ["975"]
+  deploy:
+    resources:
+      limits:
+        cpus: '16.0'
+        memory: 24G
+  environment:
+    PENNY_HICACHE_SIZE_GB: '1'
+    SGLANG_SM120_ONLINE_MXFP8: 'true'
+    TARGET_MODEL: /model
+    PYTHONPATH: /plugins
+    SGLANG_PLUGINS: shared_ram
+    PENNY_SHARED_PLE: '1'
+    PENNY_PLE_SHARED_PATH: /ple/layer-0.bin
+    PENNY_PLE_SHARED_MANIFEST: /ple/ssd-stream.json
+    # POOL SIZE = min(MAX_TOTAL_TOKENS, the profiler's estimate at MEM_FRACTION_STATIC)
+    # — two clamps, one regime each. Measured 2026-10-06 on replica B (drained from
+    # llmproxy, benched direct on :30073), fraction/ask -> #tokens / engine free:
+    #   0.981 /  899,968 -> 861,632 / 3.76 GB   (the ASK is the clamp here)
+    #   0.990 /1,049,984 -> 926,080 / 2.92 GB   (full C1/C2/C4 battery: 0 fail-lines)
+    #   0.993 /1,049,984 -> 947,520 / 2.63 GB
+    #   0.995 /1,049,984 -> 961,856 / 2.43 GB
+    #   0.997 /1,049,984 -> 976,192 / 2.26 GB
+    #   0.998 /1,049,984 -> 983,360 / 2.16 GB   <-- CURRENT (user decision 2026-10-06)
+    # A/B VERDICT, 0.990 vs 0.998 (2026-10-06, like-for-like: same card A, same seeds and
+    # calibration, 29 cells each, drained + benched direct, 0 contaminated cells):
+    #   * TTFT matched within <1% in EVERY cell; the C2/491k cell wall-clock was 153.4 s vs
+    #     154.3 s. So 0.998 buys no measurable speed — prefill bandwidth owns this workload.
+    #   * Same-config drift on this box is 7.0% median / 12.2% max (4 repeat cells), so any
+    #     decode delta below ~±12% is noise, not an effect. C1/491k alone repeated 11% apart.
+    #   * The ONE real difference is arithmetic: two 491,456-token streams (982,748) fit at
+    #     0.998 and are serialized at 0.990 (`saturated: true`, achieved_concurrency 1.0 vs
+    #     2.0). KEPT for that co-residency — two long sessions both emitting tokens instead of
+    #     one frozen — not for throughput. Caveat: this bench generated only 128 tokens at
+    #     these depths, which is exactly why it cannot price the co-residency it buys; a
+    #     realistic ~2k-token generation would be the test that can.
+    #   * Cost: loaded free VRAM ~834 MiB at 0.998 vs ~1,550 MiB at 0.990. Failure mode past
+    #     this is a hard CUDA OOM mid-conversation, which `restart: "no"` leaves visible.
+    # Rate is linear at ~7,160 tokens per +0.001 of fraction, and the ceiling is the
+    # CARD, not the config: ~80.8 GiB of weights+context+graphs on a 95.6 GiB card
+    # cannot fund the 13.02 GiB pool that 1,049,984 tokens would need. Reaching it
+    # would take fraction 1.006, so the ask above is permanently INERT and kept only
+    # as a ceiling; do not read it as the pool size -- read #tokens from the boot log.
+    # What the fraction actually buys is the depth of TWO co-resident streams:
+    #   0.990 -> 463k each · 0.995 -> 480k · 0.998 -> 491k.  Two 520k streams on ONE
+    # card need 1,040,896 tokens and are unreachable at any fraction; one 520k per
+    # card is the pair's real ceiling, which is a routing property (see llmproxy
+    # PROPOSAL-token-weighted-admission.md), not a memory one.
+    # Both knobs are env-readable, so no recipe fork is needed: MAX_TOTAL_TOKENS via
+    # configs/pennyroyal/ple-backend.sh (positive, page-size-64 aligned),
+    # MEM_FRACTION_STATIC via the serve recipe (default 0.981).
+    MAX_TOTAL_TOKENS: '1049984'
+    MEM_FRACTION_STATIC: '0.998'
+
+services:
+  # Publishes the shared PLE table into tmpfs and exits 0. Idempotent: fast path
+  # is a size check, so a restart of the pair costs ~1 s. Content is not re-hashed
+  # here — the plugin re-hashes through its own read-only mapping at boot and
+  # aborts on mismatch, so a right-size/wrong-bytes file cannot be served.
+  # Never given a memory limit: while it runs, the 47.68 GiB of tmpfs pages it
+  # writes are charged to this container's own cgroup.
+  ple-stage:
+    # Same image as the replicas on purpose: the stager runs the plugin's own guard
+    # inside the engine environment, so a different build makes the guard meaningless.
+    image: "${ENGINE_IMAGE:-lmsysorg/sglang@sha256:d6e7288627be8b02be88e4bba38e73f6d50e2826869f753c13a4c4385ab3eda9}"
+    user: root                 # must chgrp/chmod the published payload
+    entrypoint: ["/bin/sh", "/ple-stage.sh"]
+    restart: "no"
+    volumes:
+      - type: bind
+        source: /mnt/apps/sglang-flashnext/ple-stage.sh
+        target: /ple-stage.sh
+        read_only: true
+      - type: bind
+        source: /mnt/fast/ple-shared/prepared-mtpfix
+        target: /prep
+        read_only: true
+      - type: bind
+        source: /dev/shm/ple-shared
+        target: /shm
+        read_only: false
+
+  flash-next-a:
+    <<: *replica
+    depends_on:
+      ple-stage:
+        condition: service_completed_successfully
+    ports: ["30071:8001"]
+    deploy:
+      resources:
+        limits:
+          cpus: '16.0'
+          memory: 24G
+        reservations:
+          devices:
+            - capabilities: [gpu]
+              driver: nvidia
+              device_ids: ["${GPU_UUID_A:?GPU_UUID_A unset - one card per replica, never all; get yours from `nvidia-smi -L`}"]
+    volumes:
+      - {type: bind, read_only: true,  source: /mnt/fast/ple-shared/prepared-mtpfix, target: /model}
+      - {type: bind, read_only: true,  source: /mnt/fast/models/qwen38-flash-next-nvfp4-mtpfix, target: /mnt/fast/models/qwen38-flash-next-nvfp4-mtpfix}
+      - {type: bind, read_only: true,  source: /mnt/fast/models/llama-api-key, target: /api-key}
+      - {type: bind, read_only: false, source: /dev/shm/ple-shared, target: /ple}
+      - {type: bind, read_only: true,  source: /mnt/apps/sglang-flashnext/shared-ram, target: /plugins}
+      - {type: bind, read_only: false, source: /mnt/apps/sglang-flashnext/cache, target: /cache}
+      - {type: bind, read_only: false, source: /mnt/apps/sglang-flashnext/nixl, target: /nixl}
+      - {type: bind, read_only: false, source: /mnt/apps/sglang-flashnext/serve-flash-next.sh, target: /opt/pennyroyal/configs/pennyroyal/serve-flash-next.sh}
+      - {type: bind, read_only: false, source: /mnt/apps/sglang-flashnext/serve-flash-next-frspec.sh, target: /opt/pennyroyal/configs/pennyroyal/serve-flash-next-frspec.sh}
+
+  flash-next-b:
+    <<: *replica
+    # Staggered boot: A maps + warms + passes its healthcheck first, so B never
+    # races A writing the Triton/JIT cache and never boots while A is broken.
+    depends_on:
+      ple-stage:
+        condition: service_completed_successfully
+      flash-next-a:
+        condition: service_healthy
+    ports: ["30073:8001"]
+    deploy:
+      resources:
+        limits:
+          cpus: '16.0'
+          memory: 24G
+        reservations:
+          devices:
+            - capabilities: [gpu]
+              driver: nvidia
+              device_ids: ["${GPU_UUID_B:?GPU_UUID_B unset - the other card; `nvidia-smi -L`}"]
+    volumes:
+      - {type: bind, read_only: true,  source: /mnt/fast/ple-shared/prepared-mtpfix, target: /model}
+      - {type: bind, read_only: true,  source: /mnt/fast/models/qwen38-flash-next-nvfp4-mtpfix, target: /mnt/fast/models/qwen38-flash-next-nvfp4-mtpfix}
+      - {type: bind, read_only: true,  source: /mnt/fast/models/llama-api-key, target: /api-key}
+      - {type: bind, read_only: false, source: /dev/shm/ple-shared, target: /ple}
+      - {type: bind, read_only: true,  source: /mnt/apps/sglang-flashnext/shared-ram, target: /plugins}
+      - {type: bind, read_only: false, source: /mnt/apps/sglang-flashnext-b/cache, target: /cache}
+      - {type: bind, read_only: false, source: /mnt/apps/sglang-flashnext-b/nixl, target: /nixl}
+      # Recipes are SHARED with A again (trial closed 2026-10-06). The B-trial fork
+      # existed only to make --mem-fraction-static env-settable on one replica; that
+      # knob now lives in the shared copies themselves (`MEM_FRACTION_STATIC="${...:-
+      # 0.981}"`, 2 lines), so both replicas take it from here and there is once
+      # again a single recipe source. The old fork dir /mnt/apps/sglang-flashnext-b/
+      # serve-*.sh were renamed to *.retired so a rebind to them fails loudly instead
+      # of silently running a stale copy.
+      - {type: bind, read_only: false, source: /mnt/apps/sglang-flashnext/serve-flash-next.sh, target: /opt/pennyroyal/configs/pennyroyal/serve-flash-next.sh}
+      - {type: bind, read_only: false, source: /mnt/apps/sglang-flashnext/serve-flash-next-frspec.sh, target: /opt/pennyroyal/configs/pennyroyal/serve-flash-next-frspec.sh}

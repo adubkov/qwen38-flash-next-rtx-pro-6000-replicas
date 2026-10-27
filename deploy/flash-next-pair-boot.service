@@ -1,0 +1,37 @@
+[Unit]
+Description=Start the SGLang flash-next pair at boot (compose ordering, no crash-restart)
+Documentation=file:/mnt/apps/compose/sglang-flash-next-pair/compose.yaml
+# Why this unit exists: no Docker restart policy expresses "start at boot but NOT
+# after a crash". unless-stopped / always do both; on-failure restarts on crash and
+# is not reliably auto-started when it exits cleanly; "no" does neither. The pair
+# runs at --mem-fraction-static 0.998 (env in compose.yaml; the serve recipe's
+# own default is 0.981), so a crash has to stay visible as an Exited container
+# -- hence restart "no" here plus boot-start from this unit.
+#
+# This path is strictly better ordered than the policy was: `compose up` honours
+# depends_on (ple-stage -> A healthy -> B), whereas the daemon restarting the pair
+# from a policy runs no stager and applies no ordering -- the reason
+# ple-stage-onboot.service exists. With policies at "no" that unit now SKIPPS (its
+# predicate at /usr/local/bin/ple-stage-onboot.sh:95 accepts only
+# always|unless-stopped|on-failure, and "no" is also not auto-started by the daemon,
+# so the two stay consistent and nothing starts unstaged).
+#
+# INTENT: this box also runs other models, and the pair is sometimes stopped on
+# purpose to free the GPUs/RAM. Boot-start is therefore gated on a sentinel file;
+# remove it and the pair stays down across a reboot:
+#   sudo rm /mnt/apps/compose/sglang-flash-next-pair/boot-start.enabled   # disable
+#   sudo touch /mnt/apps/compose/sglang-flash-next-pair/boot-start.enabled # enable
+After=docker.service
+Requires=docker.service
+RequiresMountsFor=/mnt/fast
+ConditionPathExists=/mnt/apps/compose/sglang-flash-next-pair/boot-start.enabled
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# Two cold boots in series (each ~2.5 min) plus the ~60 GB tmpfs stage.
+TimeoutStartSec=1500
+ExecStart=/usr/bin/docker compose -f /mnt/apps/compose/sglang-flash-next-pair/compose.yaml up -d
+
+[Install]
+WantedBy=multi-user.target
